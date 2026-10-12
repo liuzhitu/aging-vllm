@@ -1,4 +1,4 @@
-from collections import deque
+from collections import Counter, deque
 import xxhash
 import numpy as np
 
@@ -55,25 +55,33 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate(self, seq: Sequence) -> int:
+    def get_cached_blocks(self, seq: Sequence) -> list[int]:
         h = -1
-        num_cached_blocks = 0
-        num_new_blocks = seq.num_blocks
+        cached_blocks = []
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 break
-            num_cached_blocks += 1
-            if block_id in self.used_block_ids:
-                num_new_blocks -= 1
+            cached_blocks.append(block_id)
+        return cached_blocks
+
+    def can_allocate(self, seq: Sequence, num_tokens: int | None = None) -> int:
+        # num_tokens is the request-local KV endpoint, not this step's chunk size.
+        if num_tokens is None:
+            num_tokens = seq.num_tokens
+        cached_blocks = self.get_cached_blocks(seq)
+        num_new_blocks = (num_tokens + self.block_size - 1) // self.block_size
+        num_new_blocks -= sum(block_id in self.used_block_ids for block_id in cached_blocks)
         if len(self.free_block_ids) < num_new_blocks:
             return -1
-        return num_cached_blocks
+        return len(cached_blocks)
 
-    def allocate(self, seq: Sequence, num_cached_blocks: int):
+    def allocate(self, seq: Sequence, num_cached_blocks: int, num_tokens: int | None = None):
         assert not seq.block_table
+        if num_tokens is None:
+            num_tokens = seq.num_tokens
         h = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
@@ -87,7 +95,8 @@ class BlockManager:
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
-        for i in range(num_cached_blocks, seq.num_blocks):
+        num_blocks = (num_tokens + self.block_size - 1) // self.block_size
+        for i in range(num_cached_blocks, num_blocks):
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
@@ -100,11 +109,35 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+    def can_append(self, seq: Sequence, num_tokens: int | None = None) -> bool:
+        if num_tokens is None:
+            num_tokens = seq.num_tokens
+        num_blocks = (num_tokens + self.block_size - 1) // self.block_size
+        return len(self.free_block_ids) >= max(0, num_blocks - len(seq.block_table))
 
-    def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
+    def can_schedule_after_preempt(self, seq: Sequence, num_tokens: int, victims: list[Sequence]) -> bool:
+        released_refs = Counter(block_id for victim in victims for block_id in victim.block_table)
+        num_free_blocks = len(self.free_block_ids) + sum(
+            self.blocks[block_id].ref_count == num_refs
+            for block_id, num_refs in released_refs.items()
+        )
+        num_blocks = (num_tokens + self.block_size - 1) // self.block_size
+        if seq.block_table:
+            num_new_blocks = max(0, num_blocks - len(seq.block_table))
+        else:
+            # A cached block losing its last owner becomes free, but adopting it
+            # consumes one free block again. Only surviving owners permit sharing.
+            num_new_blocks = num_blocks - sum(
+                self.blocks[block_id].ref_count - released_refs[block_id] > 0
+                for block_id in self.get_cached_blocks(seq)
+            )
+        return num_free_blocks >= num_new_blocks
+
+    def may_append(self, seq: Sequence, num_tokens: int | None = None):
+        if num_tokens is None:
+            num_tokens = seq.num_tokens
+        num_blocks = (num_tokens + self.block_size - 1) // self.block_size
+        for _ in range(len(seq.block_table), num_blocks):
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):

@@ -20,6 +20,8 @@ class Config:
     scheduler_policy: str = "aging"
     prefill_chunk_size: int = 256
     preemption_wait_ms: float = 50.0
+    # aging: budget the remaining prompt AND maximum output, without allocating
+    # those future blocks now. False keeps optimistic chunk-only admission.
     scheduler_reserve_full_isl: bool = True
 
     def __post_init__(self):

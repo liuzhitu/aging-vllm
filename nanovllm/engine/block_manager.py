@@ -67,14 +67,14 @@ class BlockManager:
             cached_blocks.append(block_id)
         return cached_blocks
 
-    def can_allocate(self, seq: Sequence, num_tokens: int | None = None) -> int:
+    def can_allocate(self, seq: Sequence, num_tokens: int | None = None, reserved_blocks: int = 0) -> int:
         # num_tokens is the request-local KV endpoint, not this step's chunk size.
         if num_tokens is None:
             num_tokens = seq.num_tokens
         cached_blocks = self.get_cached_blocks(seq)
         num_new_blocks = (num_tokens + self.block_size - 1) // self.block_size
         num_new_blocks -= sum(block_id in self.used_block_ids for block_id in cached_blocks)
-        if len(self.free_block_ids) < num_new_blocks:
+        if len(self.free_block_ids) - reserved_blocks < num_new_blocks:
             return -1
         return len(cached_blocks)
 

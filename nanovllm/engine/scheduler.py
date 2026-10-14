@@ -45,7 +45,7 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
-        seq.last_service_time = monotonic()
+        seq.arrival_time = seq.last_service_time = monotonic()
         self.waiting.append(seq)
 
     def schedule(self) -> SchedulerOutput:
@@ -64,14 +64,20 @@ class Scheduler:
     def _schedule_aging(self, force_preemption: bool = False) -> list[ScheduledSequence]:
         candidates = [ScheduledSequence(seq, is_prefill=False) for seq in self.running]
         candidates.extend(ScheduledSequence(seq, is_prefill=True) for seq in self.waiting)
-        candidates.sort(key=lambda item: (item.seq.last_service_time, item.seq.seq_id))
+        # Resident partial prefills are active too. Service aging applies within
+        # the resident group; non-residents can only enter in original FIFO order.
+        candidates.sort(key=lambda item: (
+            not bool(item.seq.block_table),
+            item.seq.last_service_time if item.seq.block_table else item.seq.arrival_time,
+            item.seq.arrival_time, item.seq.seq_id,
+        ))
         scheduled = []
         preempted = set()
         preemption_used = False
         now = monotonic()
         remaining = self.max_num_batched_tokens
 
-        for index, item in enumerate(candidates):
+        for item in candidates:
             if len(scheduled) == self.max_num_seqs or remaining == 0:
                 break
             seq = item.seq
@@ -94,8 +100,14 @@ class Scheduler:
 
             end = start + num_tokens
             if not seq.block_table:
-                admission_end = seq.num_tokens if self.reserve_full_prefill else end
-                can_schedule = self.block_manager.can_allocate(seq, admission_end) != -1
+                admission_end = self._reservation_end(seq) if self.reserve_full_prefill else end
+                can_schedule = self.block_manager.can_allocate(
+                    seq, admission_end, reserved_blocks=self._unallocated_reserved_blocks(),
+                ) != -1
+                if not can_schedule:
+                    # Waiting, including preempted requests, never evicts a
+                    # resident. Do not let a later arrival bypass the FIFO head.
+                    break
             else:
                 admission_end = end
                 can_schedule = self.block_manager.can_append(seq, end)
@@ -104,7 +116,9 @@ class Scheduler:
                     continue
                 if not force_preemption and now - seq.last_service_time < self.preemption_wait:
                     continue
-                if not self._preempt_for_kv(seq, admission_end, candidates[index + 1:], preempted):
+                selected = {chosen.seq for chosen in scheduled}
+                unselected = [candidate for candidate in candidates if candidate.seq not in selected]
+                if not self._preempt_for_kv(seq, admission_end, unselected, preempted):
                     continue
                 preemption_used = True
 
@@ -127,18 +141,37 @@ class Scheduler:
             return self._schedule_aging(force_preemption=True)
         return scheduled
 
+    def _reservation_end(self, seq: Sequence) -> int:
+        # The last emitted token is never forwarded once max_tokens is reached.
+        return seq.num_prompt_tokens + max(0, seq.max_tokens - 1)
+
+    def _unallocated_reserved_blocks(self) -> int:
+        if not self.reserve_full_prefill:
+            return 0
+        # Only future growth is reserved. Existing physical blocks (including
+        # shared prefixes) are already deducted from the free-block pool once.
+        return sum(
+            max(0, (self._reservation_end(seq) + self.block_size - 1) // self.block_size
+                - len(seq.block_table))
+            for seq in (*self.running, *self.waiting) if seq.block_table
+        )
+
     def _preempt_for_kv(
         self, seq: Sequence, end: int,
-        lower_priority: list[ScheduledSequence], preempted: set[Sequence],
+        unselected: list[ScheduledSequence], preempted: set[Sequence],
     ) -> bool:
+        if not seq.block_table:
+            return False
+        priority = (seq.arrival_time, seq.seq_id)
         eligible = [
-            item.seq for item in lower_priority
+            item.seq for item in unselected
             if item.seq not in preempted and item.seq.block_table
+            and (item.seq.arrival_time, item.seq.seq_id) > priority
         ]
         # Computed tokens conservatively estimate replay work. Prefix reuse may
         # reduce the actual cost; this does not estimate GPU execution time.
         eligible.sort(key=lambda victim: (
-            victim.num_cached_tokens, -victim.last_service_time, -victim.seq_id,
+            victim.num_cached_tokens, -victim.arrival_time, -victim.seq_id,
         ))
         victims = []
         for victim in eligible:

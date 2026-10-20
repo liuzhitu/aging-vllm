@@ -1,16 +1,18 @@
-# nano-vllm-scheduler
+# aging-vllm
 
-**基于 nano-vLLM 的轻量级 LLM 推理调度与 KV Cache 管理项目。**
+**基于 nano-vLLM 的轻量级 LLM 推理引擎，围绕 aging 调度协同设计混合批次、分块预填充与 KV Cache 管理。**
 
-本项目在 [GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) 的推理引擎上，实现了 Mixed Batch、Chunked Prefill、动态优先级调度、按需 KV 分配、FIFO 准入和受控抢占。围绕请求如何共享计算预算、如何使用 KV 容量以及如何在资源压力下持续推进，打通了调度计划、模型执行与请求状态提交的完整链路。
+本项目基于 [GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) 的精简推理链路，实现了以 aging（按最近成功服务时间轮换）为核心的调度机制：优先推进持有 KV 的驻留请求，在驻留请求之间优先服务更久未获计算机会的请求，新请求按 FIFO（先到先服务）顺序准入。
+
+为配合这一服务顺序，Chunked Prefill（分块预填充）限制单请求每轮的计算量，Mixed Batch（混合批次）让预填充与解码共享执行轮次；按需 KV 分配、未来容量预算和受控抢占共同约束缓存资源使用。项目打通了调度计划、模型执行与请求状态提交的完整链路，执行成功后才更新有效 KV 进度与服务时间。
 
 ## 我们做了什么
 
 | 方向 | 实现内容 | 优化目标 |
 |---|---|---|
+| **Aging 调度** | 优先推进持有 KV 的请求，在驻留请求间按最近成功服务时间排序；新请求按到达顺序准入 | 让驻留请求轮换获得计算机会，并保持新请求准入顺序 |
 | **混合批次执行** | 同一批次容纳 decode 与 prefill 请求，通过一次变长序列前向执行；每个请求独立记录执行阶段 | 让正在生成的请求与新输入共享一次执行轮次 |
 | **分块 Prefill** | 长输入分轮计算；`aging` 限制单请求的 chunk 大小，支持多个部分 prefill 同批执行 | 分散长输入计算量，增加请求之间的计算交错机会 |
-| **动态优先级调度** | 优先推进持有 KV 的请求，在驻留请求间按最近成功服务时间排序；新请求按到达顺序准入 | 让驻留请求轮换获得计算机会，并保持新请求准入顺序 |
 | **按需 KV 分配** | 根据本轮计算终点分配或扩展物理块，支持跨块续算与前缀缓存共享 | 减少尚未计算部分提前占用的 KV 块 |
 | **KV 预算准入** | 默认将剩余输入与最大输出增长纳入容量预算；未来预算与当前物理分配分开计算 | 为已准入请求后续增长保留容量预算，减少反复抢占 |
 | **受控抢占与恢复** | 保护本轮已选请求；驻留请求仅可抢占较晚到达的持有者，按已计算 token 数挑选；释放前模拟共享块引用变化 | 扩容受阻时释放足够容量，优先选择预计重算量较少的请求 |
@@ -67,7 +69,7 @@
 ```text
 请求进入 waiting 队列
     ↓
-Scheduler：驻留请求服务排序 + FIFO 准入
+Scheduler：aging 驻留请求服务排序 + FIFO 准入
     ↓
 确定每个请求的阶段与本轮 token 数
     ↓
@@ -89,10 +91,12 @@ ModelRunner：混合批次一次 varlen forward / 纯 decode 快路径
 在具备 CUDA 的 Linux 环境安装，使用本地模型目录：
 
 ```bash
-git clone https://github.com/liuzhitu/nano-vllm-scheduler.git
-cd nano-vllm-scheduler
+git clone https://github.com/liuzhitu/aging-vllm.git
+cd aging-vllm
 pip install -e .
 ```
+
+发行包名称为 `aging-vllm`，Python 导入包名沿用 `nanovllm`：
 
 ```python
 from nanovllm import LLM, SamplingParams
